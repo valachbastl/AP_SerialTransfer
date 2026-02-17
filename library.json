@@ -1,0 +1,19 @@
+{
+    "name": "AP_SerialTransfer",
+    "version": "1.0.0",
+    "releaseDate": "2026-02-09",
+    "description": "Packet-based UART communication library for ESP-IDF (compatible with Arduino SerialTransfer protocol)",
+    "keywords": ["uart", "serial", "transfer", "packet", "cobs", "crc", "esp-idf", "esp32", "freertos"],
+    "authors": [
+        {
+            "name": "Petr Adámek"
+        }
+    ],
+    "license": "UNLICENSED",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/valachbastl/AP_SerialTransfer.git"
+    },
+    "frameworks": ["espidf"],
+    "platforms": ["espressif32"]
+}
