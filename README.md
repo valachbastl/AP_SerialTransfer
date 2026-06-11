@@ -30,7 +30,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_SerialTransfer.git#v1.0.0
+    https://github.com/valachbastl/AP_SerialTransfer.git#v1.1.0
 ```
 
 ## Usage
@@ -135,7 +135,8 @@ START | ID | COBS | LEN | payload | CRC8 | STOP
 
 | Method | Description |
 |--------|-------------|
-| `begin(uartNum, txPin, rxPin, baudRate, rxBufSize)` | Initialize UART (baudRate default 115200, rxBufSize default 1024) |
+| `begin(uartNum, txPin, rxPin, baudRate, rxBufSize)` | Initialize UART (baudRate default 115200, rxBufSize default 1024). Returns `esp_err_t` (can be ignored — old API still works) |
+| `isInitialized()` | Returns true if `begin()` succeeded |
 | `sendData(messageLen, packetID)` | Send txBuff contents as packet (packetID default 0) |
 | `available()` | Non-blocking receive, returns payload bytes count (0 = no data) |
 | `tick()` | Wrapper for available(), dispatches callbacks |
@@ -176,4 +177,8 @@ START | ID | COBS | LEN | payload | CRC8 | STOP
 
 ## Author
 
-Petr Adamek
+Petr Adámek
+
+## License
+
+MIT — see [LICENSE](LICENSE).

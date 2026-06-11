@@ -53,9 +53,16 @@ public:
      * @param rxPin GPIO pin pro RX
      * @param baudRate Prenosova rychlost (default 115200)
      * @param rxBufSize Velikost RX ring bufferu (default 1024)
+     * @return ESP_OK pri uspechu, jinak chyba z UART initu / alokace mutexu.
+     *         (Navratovku lze ignorovat — stare API zustava funkcni.)
      */
-    void begin(uart_port_t uartNum, int txPin, int rxPin,
-               int baudRate = 115200, size_t rxBufSize = 1024);
+    esp_err_t begin(uart_port_t uartNum, int txPin, int rxPin,
+                    int baudRate = 115200, size_t rxBufSize = 1024);
+
+    /**
+     * @brief Vrati true pokud begin() probehl uspesne
+     */
+    bool isInitialized() const { return _initialized; }
 
     /**
      * @brief Odesle data z txBuff jako paket
@@ -146,7 +153,7 @@ public:
      * @return Index nasledujici za prectenymi daty
      */
     template <typename T>
-    uint16_t rxObj(const T &val, uint16_t index = 0, uint16_t len = sizeof(T))
+    uint16_t rxObj(T &val, uint16_t index = 0, uint16_t len = sizeof(T))
     {
         uint8_t *ptr = (uint8_t *)&val;
         uint16_t maxIndex;

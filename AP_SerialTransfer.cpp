@@ -44,8 +44,8 @@ AP_SerialTransfer::AP_SerialTransfer(const char *tag, bool arduinoCompatible)
 }
 
 
-void AP_SerialTransfer::begin(uart_port_t uartNum, int txPin, int rxPin,
-                               int baudRate, size_t rxBufSize)
+esp_err_t AP_SerialTransfer::begin(uart_port_t uartNum, int txPin, int rxPin,
+                                   int baudRate, size_t rxBufSize)
 {
     _uartNum = uartNum;
 
@@ -60,27 +60,32 @@ void AP_SerialTransfer::begin(uart_port_t uartNum, int txPin, int rxPin,
     esp_err_t err = uart_driver_install(_uartNum, rxBufSize, 0, 0, nullptr, 0);
     if (err != ESP_OK) {
         ESP_LOGE(_tag, "uart_driver_install failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
 
     err = uart_param_config(_uartNum, &uartConfig);
     if (err != ESP_OK) {
         ESP_LOGE(_tag, "uart_param_config failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
 
     err = uart_set_pin(_uartNum, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         ESP_LOGE(_tag, "uart_set_pin failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
 
     _txMutex = xSemaphoreCreateMutex();
+    if (_txMutex == nullptr) {
+        ESP_LOGE(_tag, "tx mutex alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     _initialized = true;
     ESP_LOGI(_tag, "UART%d initialized (TX:%d, RX:%d, baud:%d, mode:%s)",
              _uartNum, txPin, rxPin, baudRate,
              _arduinoCompat ? "arduino-compat" : "enhanced");
+    return ESP_OK;
 }
 
 
@@ -171,7 +176,8 @@ void AP_SerialTransfer::reset()
 
     uart_flush_input(_uartNum);
 
-    memset(txBuff, 0, sizeof(txBuff));
+    // Maze jen RX (parser stav). txBuff je TX cesta chranena _txMutex – nesahat
+    // na nej z RX, jinak race se sendData() + zahozeni cizich odchozich dat.
     memset(rxBuff, 0, sizeof(rxBuff));
 
     bytesRead    = 0;
@@ -295,19 +301,20 @@ void AP_SerialTransfer::_stuffPacket(uint8_t *data, uint8_t len)
 
 void AP_SerialTransfer::_unpackPacket(uint8_t *data)
 {
+    // COBS rozbaleni ohranicene delkou payloadu (_bytesToRec) — chrani pred
+    // zapisem mimo rxBuff pri poskozenych/zlomyslnych COBS ukazatelich z drátu.
     uint8_t testIndex = _recOverheadByte;
     uint8_t delta = 0;
 
-    if (testIndex <= ST_MAX_PACKET_SIZE)
+    while (testIndex < _bytesToRec && data[testIndex])
     {
-        while (data[testIndex])
-        {
-            delta = data[testIndex];
-            data[testIndex] = ST_START_BYTE;
-            testIndex += delta;
-        }
+        delta = data[testIndex];
         data[testIndex] = ST_START_BYTE;
+        testIndex += delta;
     }
+
+    if (testIndex < _bytesToRec)
+        data[testIndex] = ST_START_BYTE;
 }
 
 
