@@ -1,0 +1,4 @@
+version: "1.1.1"
+description: "Packet-based UART communication library for ESP-IDF (compatible with Arduino SerialTransfer protocol)"
+dependencies:
+  idf: ">=5.0.0"
