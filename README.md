@@ -11,7 +11,8 @@ Packet-based UART communication library for ESP-IDF, compatible with Arduino Ser
 - Template methods `txObj()`, `rxObj()`, `sendDatum()` for sending/receiving any data type
 - Non-blocking receive via `available()`
 - Callback support mapped to packet ID
-- Thread-safe sending (internal mutex) - safe to call `sendData()` from multiple RTOS tasks
+- Thread-safe sending (statically allocated internal mutex) - `sendData()`, `sendDatum()` and `sendPacket()` are safe to call from multiple RTOS tasks (a manual `txObj()` + `sendData()` sequence is not atomic across tasks; receiving is single-task)
+- Strict receive `rxPacket()` - rejects packets whose length (and optionally ID) does not match the expected struct
 - Configurable timeout for stale packet detection
 - ESP-IDF logging (ESP_LOGI, ESP_LOGW, ESP_LOGE)
 
@@ -30,7 +31,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_SerialTransfer.git#v1.1.1
+    https://github.com/valachbastl/AP_SerialTransfer.git#v1.2.0
 ```
 
 ## Usage
@@ -64,6 +65,31 @@ if (transfer.available())
     SensorData data = {};
     transfer.rxObj(data);
     // use data.temperature, data.humidity
+}
+```
+
+### Strict Single-Struct Packets (recommended for protocols)
+
+`rxPacket()` rejects a packet whose payload length differs from `sizeof(T)`
+(e.g. the other side runs a different struct version), instead of filling the
+rest of the object with stale bytes like `rxObj()` would. The packet ID can
+carry the message type / protocol version:
+
+```cpp
+#define PROTO_VERSION 2
+
+// Sending
+transfer.sendPacket(data, PROTO_VERSION);
+
+// Receiving
+if (transfer.available())
+{
+    SensorData data = {};
+    if (transfer.rxPacket(data, PROTO_VERSION)) {
+        // length and ID match
+    } else {
+        // wrong length or ID — data untouched
+    }
 }
 ```
 
@@ -135,7 +161,7 @@ START | ID | COBS | LEN | payload | CRC8 | STOP
 
 | Method | Description |
 |--------|-------------|
-| `begin(uartNum, txPin, rxPin, baudRate, rxBufSize)` | Initialize UART (baudRate default 115200, rxBufSize default 1024). Returns `esp_err_t` (can be ignored — old API still works) |
+| `begin(uartNum, txPin, rxPin, baudRate, rxBufSize)` | Initialize UART (baudRate default 115200, rxBufSize default 1024). Idempotent, retryable after failure. Returns `esp_err_t` (can be ignored — old API still works) |
 | `isInitialized()` | Returns true if `begin()` succeeded |
 | `sendData(messageLen, packetID)` | Send txBuff contents as packet (packetID default 0) |
 | `available()` | Non-blocking receive, returns payload bytes count (0 = no data) |
@@ -153,6 +179,9 @@ START | ID | COBS | LEN | payload | CRC8 | STOP
 | `txObj(val, index, len)` | Write object to TX buffer at index (default 0) |
 | `rxObj(val, index, len)` | Read object from RX buffer at index (default 0) |
 | `sendDatum(val, len)` | Send single object as packet (shortcut for txObj + sendData) |
+| `sendPacket(val, packetID)` | Send whole object as packet with given ID (packetID default 0) |
+| `rxPacket(val)` | Strict read: copies only if payload length == `sizeof(T)`, returns bool |
+| `rxPacket(val, expectedID)` | Strict read with packet ID check, returns bool |
 
 ### Public Members
 

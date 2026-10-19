@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.2.0] - 2026-10-19
+
+### Added
+- `rxPacket(val)` — prisne precteni celeho paketu: overi, ze prijaty payload ma presne `sizeof(T)` bajtu, jinak vrati `false` a objekt nemeni. `rxObj()` delku nekontroluje — kratsi paket (napr. jina verze struktury na druhe strane) doplnil zbytek objektu starymi bajty z `rxBuff`.
+- `rxPacket(val, expectedID)` — navic overi ID paketu (typ/verze zpravy).
+- `sendPacket(val, packetID)` — protejsek `rxPacket()`: odesle cely objekt s danym ID (`sendDatum()` ID nastavit neumi).
+- `static_assert` na velikost objektu u obou novych metod (objekt > 254 B = chyba prekladu).
+
+### Fixed
+- **Prijem prestal fungovat po 49,7 dnech behu:** `_packetStart` byl `uint32_t`, ale porovnaval se s 64bitovym casem v ms (`esp_timer_get_time() / 1000`). Po 2^32 ms vychazel rozdil vzdy ~2^32 → kazdy paket skoncil jako `STALE_PACKET_ERROR` az do restartu. `_packetStart` je nyni `uint64_t`.
+- Chyba ramce (CRC, stop byte, delka, timeout) uz nevyprazdnuje cely UART RX buffer — drive jeden poskozeny bajt zahodil i vsechny platne pakety, ktere za nim uz cekaly. Parser se jen resetuje a hleda dalsi start byte (falesny start odmitne delka/CRC/stop byte). Rucni `reset()` dal buffer vyprazdnuje.
+- Bajt, na kterem se odhali timeout nebo chybejici stop byte, se uz nezahazuje — pokud je to start byte, zacne se jim rovnou novy paket (useknuty ramec nasledovany novym neztrati i ten novy).
+- `sendDatum()` nebyl thread-safe, prestoze knihovna slibuje bezpecne odesilani z vice tasku: objekt se kopiroval do sdileneho `txBuff` pres `txObj()` mimo TX mutex, takze dva soubezne odesilajici tasky si mohly data prepsat. Kopie i odeslani ted probehnou pod jednim drzenim mutexu (stejne `sendPacket()`). Rucni sekvence `txObj()` + `sendData()` zustava ne-atomicka — zdokumentovano v hlavicce.
+- `sendDatum(val, len)` s `len > sizeof(T)` cetl za koncem objektu — `len` se nyni orezava na `sizeof(T)`.
+- `begin()` je idempotentni (druhe volani po uspechu vrati `ESP_OK`, driv selhalo na `uart_driver_install`) a pri selhani `uart_param_config`/`uart_set_pin` odinstaluje UART driver, takze jde `begin()` zopakovat.
+
+### Changed
+- TX mutex staticky alokovany (`StaticSemaphore_t` + `xSemaphoreCreateMutexStatic()`) v konstruktoru misto `xSemaphoreCreateMutex()` v `begin()` — nemuze selhat na OOM, odpada `ESP_ERR_NO_MEM` vetev v `begin()`. Vyzaduje `CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION=y` (ESP-IDF default).
+- Trida je nekopirovatelna (copy ctor/assign `= delete`) — kopie by rozbila staticky mutex. Kopirovani objektu nikdy nedavalo smysl (vlastni UART driver).
+- Komentare a log texty v kodu prepsany do anglictiny.
+- `TODO_next_version.md` pridan do `.gitignore` (lokalni pracovni poznamka).
+- Jinak `rxObj()`, `sendDatum()` a ostatni API beze zmeny (zpetne kompatibilni).
+
 ## [1.1.1] - 2026-06-16
 
 ### Added

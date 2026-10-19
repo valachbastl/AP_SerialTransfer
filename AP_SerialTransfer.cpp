@@ -19,10 +19,13 @@ AP_SerialTransfer::AP_SerialTransfer(const char *tag, bool arduinoCompatible)
       _recCrcHigh(0),
       _callbacks(nullptr),
       _callbacksLen(0),
-      _txMutex(nullptr),
       bytesRead(0),
       status(0)
 {
+    // Static allocation — cannot fail (no OOM), the handle is valid for the
+    // whole object lifetime, even if begin() fails or is never called.
+    _txMutex = xSemaphoreCreateMutexStatic(&_txMutexBuf);
+
     memset(txBuff, 0, sizeof(txBuff));
     memset(rxBuff, 0, sizeof(rxBuff));
     memset(_preamble, 0, sizeof(_preamble));
@@ -47,6 +50,8 @@ AP_SerialTransfer::AP_SerialTransfer(const char *tag, bool arduinoCompatible)
 esp_err_t AP_SerialTransfer::begin(uart_port_t uartNum, int txPin, int rxPin,
                                    int baudRate, size_t rxBufSize)
 {
+    if (_initialized) return ESP_OK;  // idempotent
+
     _uartNum = uartNum;
 
     uart_config_t uartConfig = {};
@@ -63,22 +68,20 @@ esp_err_t AP_SerialTransfer::begin(uart_port_t uartNum, int txPin, int rxPin,
         return err;
     }
 
+    // Driver is installed from here on — uninstall it on any later failure so
+    // begin() can be retried (a second uart_driver_install() would fail).
     err = uart_param_config(_uartNum, &uartConfig);
     if (err != ESP_OK) {
         ESP_LOGE(_tag, "uart_param_config failed: %s", esp_err_to_name(err));
+        uart_driver_delete(_uartNum);
         return err;
     }
 
     err = uart_set_pin(_uartNum, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         ESP_LOGE(_tag, "uart_set_pin failed: %s", esp_err_to_name(err));
+        uart_driver_delete(_uartNum);
         return err;
-    }
-
-    _txMutex = xSemaphoreCreateMutex();
-    if (_txMutex == nullptr) {
-        ESP_LOGE(_tag, "tx mutex alloc failed");
-        return ESP_ERR_NO_MEM;
     }
 
     _initialized = true;
@@ -94,14 +97,38 @@ uint8_t AP_SerialTransfer::sendData(uint16_t messageLen, uint8_t packetID)
     if (!_initialized) return 0;
 
     xSemaphoreTake(_txMutex, portMAX_DELAY);
+    uint8_t numBytes = _transmitLocked(messageLen, packetID);
+    xSemaphoreGive(_txMutex);
 
+    return numBytes;
+}
+
+
+// Copy + send under one mutex hold — the whole send is atomic, so concurrent
+// sendDatum()/sendPacket() calls from different tasks cannot overwrite each
+// other's txBuff contents.
+uint8_t AP_SerialTransfer::_sendBytes(const void *data, uint16_t len, uint8_t packetID)
+{
+    if (!_initialized) return 0;
+    if (len > ST_MAX_PACKET_SIZE) len = ST_MAX_PACKET_SIZE;
+
+    xSemaphoreTake(_txMutex, portMAX_DELAY);
+    memcpy(txBuff, data, len);
+    uint8_t numBytes = _transmitLocked(len, packetID);
+    xSemaphoreGive(_txMutex);
+
+    return numBytes;
+}
+
+
+// Caller must hold _txMutex.
+uint8_t AP_SerialTransfer::_transmitLocked(uint16_t messageLen, uint8_t packetID)
+{
     uint8_t numBytes = _constructPacket(messageLen, packetID);
 
     uart_write_bytes(_uartNum, _preamble, _preambleSize);
     uart_write_bytes(_uartNum, txBuff, numBytes);
     uart_write_bytes(_uartNum, _postamble, _postambleSize);
-
-    xSemaphoreGive(_txMutex);
 
     return numBytes;
 }
@@ -128,12 +155,9 @@ uint8_t AP_SerialTransfer::available()
 
             bytesRead = _parse(recChar, valid);
 
+            // Error paths reset the parser themselves (_parse), nothing to do here.
             if (status != ST_CONTINUE)
-            {
-                if (status <= 0)
-                    reset();
                 break;
-            }
 
             uart_get_buffered_data_len(_uartNum, &buffered);
         }
@@ -141,9 +165,6 @@ uint8_t AP_SerialTransfer::available()
     else
     {
         bytesRead = _parse(recChar, false);
-
-        if (status <= 0)
-            reset();
     }
 
     return bytesRead;
@@ -176,10 +197,20 @@ void AP_SerialTransfer::reset()
 
     uart_flush_input(_uartNum);
 
-    // Maze jen RX (parser stav). txBuff je TX cesta chranena _txMutex – nesahat
-    // na nej z RX, jinak race se sendData() + zahozeni cizich odchozich dat.
+    // Clears RX only (parser state). txBuff belongs to the TX path guarded by
+    // _txMutex — touching it here would race with sendData() and drop outgoing data.
     memset(rxBuff, 0, sizeof(rxBuff));
 
+    _resetParser();
+}
+
+
+// Parser-only reset used on framing errors: no UART flush, so packets already
+// buffered behind a corrupted one survive. The parser then hunts for the next
+// start byte; a false start (0x7E can also appear inside a payload or header)
+// is rejected by the length, CRC and stop byte checks.
+void AP_SerialTransfer::_resetParser()
+{
     bytesRead    = 0;
     _packetStart = 0;
     _state       = find_start_byte;
@@ -199,7 +230,7 @@ void AP_SerialTransfer::setTimeout(uint32_t timeoutMs)
 }
 
 
-// --- CRC-8 (polynom 0x9B, kompatibilni s Arduino SerialTransfer) ---
+// --- CRC-8 (polynomial 0x9B, compatible with Arduino SerialTransfer) ---
 
 void AP_SerialTransfer::_generateCrcTable8(uint8_t polynomial)
 {
@@ -227,7 +258,7 @@ uint8_t AP_SerialTransfer::_calcCrc8(uint8_t *data, uint8_t len)
 }
 
 
-// --- CRC-16/CCITT-FALSE (polynom 0x1021, init 0xFFFF) ---
+// --- CRC-16/CCITT-FALSE (polynomial 0x1021, init 0xFFFF) ---
 
 void AP_SerialTransfer::_generateCrcTable16(uint16_t polynomial)
 {
@@ -255,7 +286,7 @@ uint16_t AP_SerialTransfer::_calcCrc16(uint8_t *data, uint8_t len)
 }
 
 
-// --- COBS kodovani (Consistent Overhead Byte Stuffing) ---
+// --- COBS encoding (Consistent Overhead Byte Stuffing) ---
 
 void AP_SerialTransfer::_calcOverhead(uint8_t *data, uint8_t len)
 {
@@ -301,8 +332,8 @@ void AP_SerialTransfer::_stuffPacket(uint8_t *data, uint8_t len)
 
 void AP_SerialTransfer::_unpackPacket(uint8_t *data)
 {
-    // COBS rozbaleni ohranicene delkou payloadu (_bytesToRec) — chrani pred
-    // zapisem mimo rxBuff pri poskozenych/zlomyslnych COBS ukazatelich z drátu.
+    // COBS unstuffing bounded by the payload length (_bytesToRec) — protects
+    // against writes past rxBuff on corrupted/malicious COBS pointers from the wire.
     uint8_t testIndex = _recOverheadByte;
     uint8_t delta = 0;
 
@@ -318,7 +349,7 @@ void AP_SerialTransfer::_unpackPacket(uint8_t *data)
 }
 
 
-// --- Sestaveni paketu ---
+// --- Packet construction ---
 
 uint8_t AP_SerialTransfer::_constructPacket(uint16_t messageLen, uint8_t packetID)
 {
@@ -344,7 +375,7 @@ uint8_t AP_SerialTransfer::_constructPacket(uint16_t messageLen, uint8_t packetI
         uint16_t crcVal = _calcCrc16(txBuff, len);
 
         _preamble[1] = packetID;
-        _preamble[2] = _txSeqNum++;  // Auto-increment sekvencniho cisla
+        _preamble[2] = _txSeqNum++;  // Auto-increment the sequence number
         _preamble[3] = _overheadByte;
         _preamble[4] = len;
 
@@ -356,7 +387,7 @@ uint8_t AP_SerialTransfer::_constructPacket(uint16_t messageLen, uint8_t packetI
 }
 
 
-// --- Stavovy automat parseru ---
+// --- Parser state machine ---
 
 uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
 {
@@ -366,13 +397,16 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
     if (!packetFresh)
     {
         ESP_LOGW(_tag, "STALE_PACKET_ERROR");
+        _resetParser();
 
-        bytesRead    = 0;
-        _state       = find_start_byte;
-        status       = ST_STALE_PACKET_ERROR;
-        _packetStart = 0;
-
-        return bytesRead;
+        // No byte to process (poll without data) → report the timeout. Otherwise
+        // fall through: the byte that revealed the timeout may be the start of a
+        // new packet and must not be dropped.
+        if (!valid)
+        {
+            status = ST_STALE_PACKET_ERROR;
+            return bytesRead;
+        }
     }
 
     if (valid)
@@ -392,14 +426,14 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
         case find_id_byte:
         {
             _idByte = recChar;
-            // Compat → rovnou overhead, Enhanced → nejdriv seq cislo
+            // Compat → overhead byte next, Enhanced → sequence number first
             _state = _arduinoCompat ? find_overhead_byte : find_seq_byte;
             break;
         }
 
         case find_seq_byte:
         {
-            // Pouze enhanced mode
+            // Enhanced mode only
             _rxSeqNum = recChar;
             _state    = find_overhead_byte;
             break;
@@ -423,10 +457,8 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
             else
             {
                 ESP_LOGW(_tag, "PAYLOAD_ERROR");
-                bytesRead = 0;
-                _state    = find_start_byte;
-                status    = ST_PAYLOAD_ERROR;
-                reset();
+                _resetParser();
+                status = ST_PAYLOAD_ERROR;
                 return bytesRead;
             }
             break;
@@ -449,7 +481,7 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
         {
             if (_arduinoCompat)
             {
-                // Compat: jednobytovy CRC-8
+                // Compat: single-byte CRC-8
                 uint8_t calcCrc = _calcCrc8(rxBuff, _bytesToRec);
 
                 if (calcCrc == recChar)
@@ -459,16 +491,14 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
                 else
                 {
                     ESP_LOGW(_tag, "CRC_ERROR");
-                    bytesRead = 0;
-                    _state    = find_start_byte;
-                    status    = ST_CRC_ERROR;
-                    reset();
+                    _resetParser();
+                    status = ST_CRC_ERROR;
                     return bytesRead;
                 }
             }
             else
             {
-                // Enhanced: prvni bajt CRC-16 (high byte), ulozit a pokracovat
+                // Enhanced: first CRC-16 byte (high byte), store and continue
                 _recCrcHigh = recChar;
                 _state      = find_crc_low;
             }
@@ -477,7 +507,7 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
 
         case find_crc_low:
         {
-            // Enhanced mode: druhy bajt CRC-16 (low byte)
+            // Enhanced mode: second CRC-16 byte (low byte)
             uint16_t recCrc  = ((uint16_t)_recCrcHigh << 8) | recChar;
             uint16_t calcCrc = _calcCrc16(rxBuff, _bytesToRec);
 
@@ -488,10 +518,8 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
             else
             {
                 ESP_LOGW(_tag, "CRC_ERROR (CRC-16: expected 0x%04X, got 0x%04X)", calcCrc, recCrc);
-                bytesRead = 0;
-                _state    = find_start_byte;
-                status    = ST_CRC_ERROR;
-                reset();
+                _resetParser();
+                status = ST_CRC_ERROR;
                 return bytesRead;
             }
             break;
@@ -520,18 +548,23 @@ uint8_t AP_SerialTransfer::_parse(uint8_t recChar, bool valid)
             }
 
             ESP_LOGW(_tag, "STOP_BYTE_ERROR");
-            bytesRead = 0;
-            status    = ST_STOP_BYTE_ERROR;
-            reset();
+            _resetParser();
+            status = ST_STOP_BYTE_ERROR;
+
+            // Truncated frame followed directly by a new one: this byte may be
+            // the next start byte — begin the new packet instead of dropping it.
+            if (recChar == ST_START_BYTE)
+            {
+                _state       = find_id_byte;
+                _packetStart = now;
+            }
             return bytesRead;
         }
 
         default:
         {
             ESP_LOGW(_tag, "Undefined parser state %d", _state);
-            reset();
-            bytesRead = 0;
-            _state    = find_start_byte;
+            _resetParser();
             break;
         }
         }
